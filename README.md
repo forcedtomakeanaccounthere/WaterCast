@@ -1,158 +1,178 @@
-# Groundwater Level Forecasting for Pump Control
+# WaterCast - Groundwater Level Forecasting for Pump Control
 
-## Project goal
-Forecast pond/groundwater level using weather + autoregressive signals so pump operation can be planned early and overflow risk can be reduced.
+WaterCast is a groundwater and tank-level forecasting project with a React monitoring dashboard. It combines historical water-level data, weather observations, autoregressive features, and notebook-trained machine-learning artifacts to support early pump planning and overflow monitoring.
 
-## Current pipeline
-1. Data preparation notebook: water_level.ipynb
-2. Model training notebook: model_water_level.ipynb
-3. Final training dataset: preprocessed_water_level_data.csv
+The repository contains two related workflows:
 
-## Core data files
-- abhishek data.txt: raw weather station export
-- weather_data.csv: cleaned weather table
-- pool_groundwater_level.csv: raw pond/tank level records
-- preprocessed_water_level_data.csv: merged + engineered hourly model data
+1. **Research and training:** Jupyter notebooks prepare data, compare models, and write the serialized artifacts used by the dashboard.
+2. **Monitoring dashboard:** An Express API calls a Python forecast adapter, and a React/Vite application presents forecasts, weather conditions, operations, and alerts.
 
-## Feature strategy (current)
-The model uses three groups:
+## Repository layout
 
-1. Autoregressive features
-- wl_lag_1h, wl_lag_6h, wl_lag_24h
-- wl_change_1h, wl_change_6h, wl_change_24h
+```text
+.
+├── water_level.ipynb                    # data cleaning and feature engineering
+├── model_water_level.ipynb              # model training and evaluation
+├── pool_groundwater_level.csv           # raw water-level records
+├── abhishek data.txt                    # raw weather-station export
+├── weather_data.csv                     # cleaned weather data
+├── preprocessed_water_level_data.csv    # model-ready data
+├── best_model_*.pkl, *.pkl              # trained model artifacts
+├── lstm_water_level.keras               # optional TensorFlow artifact
+└── dashboard/
+    ├── backend/                         # Express API and forecast bridge
+    │   ├── python/forecast_snapshot.py  # Python forecast and alert engine
+    │   └── data/                        # dashboard CSV history
+    └── frontend/                        # React/Vite dashboard
+```
 
-2. Weather and temporal features
-- Temp_Out, Out_Hum, Dew_Pt, Bar, Rain, Rain_Rate, Solar_Rad, Wind_Speed, etc.
-- rain_sum_24h, rain_sum_72h
-- temp_avg_24h, hum_avg_24h
-- bar_change_3h, bar_change_24h
-- hour_sin/hour_cos, month_sin/month_cos, is_daytime
+## How the system works
 
-3. Operational regime indicators
-- wl_drop_event_1h, wl_rise_event_1h
-- drain_after_rain_flag
-- pump_cycle_recent_6h
-- rain_x_humidity, rain_x_wl_lag1
+```text
+Notebook data + trained artifacts
+              │
+              ▼
+preprocessed_water_level_data.csv ──► forecast_snapshot.py
+                                         │
+                 Open-Meteo weather ────┤
+                                         ▼
+                              JSON dashboard snapshot
+                                         │
+                                         ▼
+                          Express API ──► React dashboard
+```
 
-Important: lag/change features are shifted to past timestamps, so this is autoregression, not leakage.
+### Forecast and dashboard behavior
 
-## What was fixed in v4
-Recent regression happened after adding aggressive event sample weighting. That hurt global fit.
+- The Python adapter loads `preprocessed_water_level_data.csv` and the checked-in pickle artifacts from the repository root.
+- Historical rows are time-shifted so the final historical row represents the current hour for dashboard demonstration purposes.
+- A forecast request attempts to fetch hourly and daily weather from Open-Meteo for the configured location near Tirupati, India. If that request fails, the forecast falls back to historical weather and locally estimated rainfall.
+- Forecast horizons are clamped by the Python adapter to **6-72 hours**. The frontend currently offers 12, 24, 36, and 48 hours.
+- Forecast alerts use thresholds of 75% for warning and 85% for critical operation. Pump recommendations are rule-based and capped at two pumps.
+- The backend also starts a local water-level simulation every 15 minutes. It writes `dashboard/backend/data/actual_water_level.csv` and `tank_levels.csv`; this is a simulated feed, not a hardware sensor integration.
+- Weather polling uses the configured Davis weather service and writes `actual_weather_data.csv` and `weather_observations.csv` every 15 minutes. The current implementation contains the Davis API URL in source code; credentials should be moved to environment variables and rotated before deploying this project.
+- MongoDB persistence is optional. If MongoDB is unavailable, the API continues serving snapshots without persistence.
 
-v4 changes:
-- Removed training sample weighting from all models
-- Kept event masks for diagnostics only (EVENT_RMSE, EVENT_MAE)
-- Added robust baseline: Huber Regressor
-- Tuned Ridge (alpha=0.1), Random Forest, and XGBoost
-- Added simple blend model:
-  - y_hat = 0.7 * XGBoost + 0.2 * Huber + 0.1 * Ridge
-- Removed temporary experiment cells and bloat
+## Data and modeling workflow
 
-## v5 refinement (time-series CV + hybrid optimization)
-Added a deeper optimization cycle focused on robust generalization:
-- TimeSeriesSplit cross-validation on the training window
-- GridSearchCV tuning for Ridge and XGBoost
-- CV sweep for Huber parameters (epsilon, alpha)
-- OOF blend-weight search for hybrid ensemble
+Run the notebooks from the repository root in order:
 
-Final hybrid from v5:
-- y_hat = 0.00 * Ridge + 0.15 * Huber + 0.85 * XGBoost
+1. Open `water_level.ipynb` and run all cells to regenerate `preprocessed_water_level_data.csv`.
+2. Open `model_water_level.ipynb` and run all cells to train/evaluate models and regenerate the serialized artifacts.
 
-## v6 final round (deep scrutiny, anti-overfit)
-One final strict improvement cycle was run with explicit anti-overfitting guardrails:
-- Constrained OOF stacking (weights >= 0 and sum to 1)
-- Feature-pruned XGBoost CV (top-20 most informative features only)
-- Final local blend search around the top model
+The feature set includes:
 
-Final v6 best blend:
-- y_hat = 0.84 * XGBoost(top-20 features) + 0.16 * Naive persistence + 0.00 * Huber
+- lagged and change-based water-level features such as `wl_lag_1h`, `wl_lag_6h`, and `wl_lag_24h`;
+- weather signals including temperature, humidity, pressure, rainfall, solar radiation, and wind;
+- rolling rainfall and weather summaries;
+- cyclical time features such as hour and month sine/cosine values; and
+- event and operational indicators for rising, dropping, draining, and overflow conditions.
 
-## Latest validated results (80/20 chronological split)
-Best model:
-- Blend around top20 XGB (xgb=0.84, huber=0.00, naive=0.16)
-- MAE = 0.661
-- RMSE = 1.689
-- R2 = 0.660
-- MAPE = 1.140%
+The latest metrics recorded in the repository for an 80/20 chronological split are notebook results, not a startup health check:
 
-Second best:
-- XGBoost CV tuned (top-20 features)
-- MAE = 0.672
-- RMSE = 1.707
-- R2 = 0.653
-- MAPE = 1.156%
+| Model | MAE | RMSE | R² | MAPE |
+| --- | ---: | ---: | ---: | ---: |
+| Top-20 XGBoost + naive persistence blend | 0.661 | 1.689 | 0.660 | 1.140% |
+| Tuned top-20 XGBoost | 0.672 | 1.707 | 0.653 | 1.156% |
 
-Compared to degraded run after prior patch:
-- R2: 0.514 -> 0.660
-- RMSE: 2.025 -> 1.689
-- MAE: 1.200 -> 0.661
-- MAPE: 2.146% -> 1.140%
+The dashboard primarily loads `best_model_xgb_cv_top20.pkl`, `best_model_huber_cv.pkl`, `hybrid_scaler.pkl`, and `best_hybrid_meta.pkl`. Other repository artifacts support notebook experiments and comparisons.
 
-## Multi-horizon snapshot (v4)
-With direct horizon-wise models (24h to 120h), errors are much more stable than previous extremely negative runs:
-- 24h: RMSE about 3.004, R2 about -0.070
-- 48h: RMSE about 3.124, R2 about -0.152
-- 72h: RMSE about 3.031, R2 about -0.080
-- 96h: RMSE about 3.115, R2 about -0.135
-- 120h: RMSE about 3.013, R2 about -0.058
+## Run the dashboard
 
-## How to run
-1. Run water_level.ipynb fully (top to bottom) to regenerate preprocessed_water_level_data.csv
-2. Run model_water_level.ipynb fully (top to bottom) to train/evaluate models and save artifacts
+### Prerequisites
 
-## Saved model artifacts
-- best_model_rf.pkl
-- best_model_xgb_cv.pkl
-- best_model_xgb_cv_top20.pkl
-- best_model_ridge_cv.pkl
-- best_model_huber_cv.pkl
-- hybrid_scaler.pkl
-- best_hybrid_meta.pkl
-- multi_horizon_models.pkl
-- lstm_water_level.keras (if TensorFlow available)
+- Node.js and npm
+- Python 3.9+ recommended
+- Python packages used by the forecast adapter:
 
-## Notes
-- TensorFlow should be imported before numpy/sklearn on this Windows machine to avoid DLL load-order issues.
-- Multi-horizon scores naturally degrade as horizon increases.
+```bash
+python -m pip install numpy pandas scikit-learn xgboost
+```
 
-## Monitoring dashboard (new)
-A full web dashboard is now available in `dashboard/` with:
+TensorFlow is only needed when working with the LSTM notebook/artifact; the dashboard forecast adapter does not import TensorFlow.
 
-- Frontend: React + Vite + Recharts
-- Backend: Express API + optional MongoDB persistence
-- Prediction bridge: Python service that reads notebook-trained artifacts and generates live forecast snapshots
+### 1. Configure the backend
 
-### Folder structure
-- dashboard/frontend: UI app (overview/environment/operations/alerts)
-- dashboard/backend: API + Python integration
-- dashboard/backend/python/forecast_snapshot.py: forecast + alert + pump recommendation logic (max 2 pumps)
+```bash
+cd dashboard/backend
+cp .env.example .env
+```
 
-### Backend API endpoints
-- GET /api/health
-- GET /api/dashboard/snapshot?horizon=24
-- POST /api/dashboard/refresh
+Available backend variables:
 
-### Environment files
-- `dashboard/backend/.env`
-  - PORT=5000
-  - MONGODB_URI=<optional>
-  - PYTHON_CMD=<path to python executable>
-- `dashboard/frontend/.env`
-  - VITE_API_BASE_URL=http://localhost:5000/api
+| Variable | Default | Purpose |
+| --- | --- | --- |
+| `PORT` | `5000` | Express listening port |
+| `MONGODB_URI` | unset | Optional MongoDB connection for snapshot, alert, and notification persistence |
+| `PYTHON_CMD` | platform fallback | Python executable, for example `python`, `python3`, or an absolute path |
 
-### Run the dashboard
-1. Start backend:
-   - `cd dashboard/backend`
-   - `npm install`
-   - `npm run start`
-2. Start frontend in another terminal:
-   - `cd dashboard/frontend`
-   - `npm install`
-   - `npm run dev`
+`MONGODB_URI` may be left unset. A failed MongoDB connection is logged and does not stop the server.
 
-### What the dashboard shows
-- Live and forecasted water level profile
-- Capacity/overflow alerts and operator notifications
-- Pump recommendation with hard cap at 2 pumps
-- Environmental trends: rainfall, groundwater response, regional forecast
-- Operations view: pump status, activity log, maintenance items
+Install and start the API:
+
+```bash
+npm install
+npm start
+```
+
+For development with automatic restart:
+
+```bash
+npm run dev
+```
+
+### 2. Start the frontend
+
+In a second terminal:
+
+```bash
+cd dashboard/frontend
+npm install
+npm run dev
+```
+
+The Vite development server is normally available at `http://localhost:5173`. The frontend uses `http://localhost:5000/api` by default. To point it elsewhere, create `dashboard/frontend/.env`:
+
+```dotenv
+VITE_API_BASE_URL=http://localhost:5000/api
+```
+
+The frontend can be built and linted with:
+
+```bash
+npm run lint
+npm run build
+```
+
+## API reference
+
+The backend listens on `http://localhost:5000` by default.
+
+| Method | Endpoint | Description |
+| --- | --- | --- |
+| `GET` | `/` | Service information and endpoint summary |
+| `GET` | `/api/health` | Health response with service name and timestamp |
+| `GET` | `/api/dashboard/snapshot?horizon=24` | Forecast snapshot for the requested horizon; cached for 60 seconds by default |
+| `POST` | `/api/dashboard/refresh` | Clears the snapshot cache, regenerates a snapshot, and persists it when MongoDB is connected |
+| `GET` | `/api/weather` | Historical rows from `actual_weather_data.csv` |
+| `GET` | `/api/weather/conditions?range=hourly` | Aggregated weather conditions for `hourly`, `daily`, `monthly`, or `yearly` ranges |
+| `GET` | `/api/water-level` | Raw CSV contents of `actual_water_level.csv` |
+
+`/api/dashboard/snapshot` returns `overview`, `environmental`, `operations`, `alerts`, `notifications`, and `systemLogs`. A snapshot error is returned as an HTTP 500 response; the Python adapter itself emits a degraded fallback payload when its forecast work fails.
+
+## Frontend sections
+
+- `/` **Overview:** live/simulated level, forecast profile, weekly rainfall, historical level filtering, and operating notes.
+- `/weather-conditions` **Weather Conditions:** latest weather metrics and hourly/daily/monthly/yearly aggregates.
+- `/environment` **Environment:** rainfall versus groundwater history and regional rainfall outlook.
+- `/operations` **Operations:** severity, pump recommendation, pump status, activity log, and maintenance items.
+- `/alerts` **Alerts:** active alerts, notifications, and forecast system logs.
+
+## Important limitations
+
+- The dashboard is a demonstration and decision-support interface, not an automatic pump controller. Recommendations must be verified by an operator.
+- The water-level stream is simulated in Node.js and does not read a physical tank sensor.
+- The Python script uses a fixed location and shifts historical timestamps to the current time, so dashboard timestamps are synthetic.
+- Open-Meteo access requires network connectivity. The adapter has a historical/local fallback, but the weather source may be reported as `fallback`.
+- The Davis weather integration currently depends on credentials embedded in `dashboard/backend/src/services/weatherService.js`. Do not deploy the repository as-is with those credentials; move them to environment variables and rotate exposed credentials.
+- There are no automated backend tests configured yet; `npm test` currently reports that no tests are configured.
